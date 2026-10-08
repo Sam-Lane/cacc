@@ -1,3 +1,4 @@
+mod doctor;
 mod kc;
 mod live;
 mod pick;
@@ -7,6 +8,7 @@ mod usage;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
+use std::io::{BufRead, IsTerminal, Write};
 use std::process::Command;
 use store::Index;
 
@@ -35,6 +37,18 @@ enum Cmd {
     Login { name: Option<String> },
     /// Save the account Claude Code is currently logged in to
     Add { name: Option<String> },
+    /// Delete a saved account (does not log Claude Code out)
+    #[command(alias = "rm")]
+    Remove {
+        account: String,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Rename a saved account
+    Rename { old: String, new: String },
+    /// Check tools, the live login and every saved account for problems
+    Doctor,
 }
 
 fn main() {
@@ -52,6 +66,20 @@ fn run() -> Result<()> {
         Cmd::Switch { account } => set(&mut idx, account),
         Cmd::Usage { account } => usage(&mut idx, account),
         Cmd::Login { name } => login(&mut idx, name),
+        Cmd::Remove { account, yes } => remove(&mut idx, &account, yes),
+        Cmd::Rename { old, new } => {
+            let i = idx.resolve(&old)?;
+            let before = idx.accounts[i].name.clone();
+            idx.rename(i, &new)?;
+            println!("renamed '{before}' to '{new}'");
+            Ok(())
+        }
+        Cmd::Doctor => {
+            if !doctor::run(&idx)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::Add { name } => {
             let i = idx.capture(name.as_deref())?;
             println!(
@@ -178,5 +206,30 @@ fn login(idx: &mut Index, name: Option<String>) -> Result<()> {
         "saved '{}' <{}>",
         idx.accounts[i].name, idx.accounts[i].email
     );
+    Ok(())
+}
+
+fn remove(idx: &mut Index, query: &str, yes: bool) -> Result<()> {
+    let i = idx.resolve(query)?;
+    let (name, email) = (idx.accounts[i].name.clone(), idx.accounts[i].email.clone());
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to remove without --yes when stdin is not a terminal");
+        }
+        eprint!("remove '{name}' <{email}>? [y/N] ");
+        std::io::stderr().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().lock().read_line(&mut ans)?;
+        if !matches!(ans.trim(), "y" | "Y" | "yes") {
+            eprintln!("cancelled");
+            return Ok(());
+        }
+    }
+    let was_active = idx.active()? == Some(i);
+    idx.remove(i)?;
+    println!("removed '{name}' <{email}>");
+    if was_active {
+        println!("Claude Code is still logged in as this account; it is just no longer saved");
+    }
     Ok(())
 }

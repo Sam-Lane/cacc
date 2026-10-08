@@ -41,6 +41,31 @@ fn str_field(v: &Value, k: &str) -> String {
         .to_string()
 }
 
+/// Names must be safe as keychain/file keys and must not collide with how
+/// `Index::resolve` interprets a query (number, other account's name or email).
+pub fn validate_name(name: &str, accounts: &[Account], except: Option<usize>) -> Result<()> {
+    if name.is_empty() {
+        bail!("account name cannot be empty");
+    }
+    if name
+        .chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
+        bail!("account name '{name}' cannot contain whitespace or slashes");
+    }
+    if name.parse::<usize>().is_ok() {
+        bail!("account name '{name}' cannot be a number (numbers select by position)");
+    }
+    let clash = accounts
+        .iter()
+        .enumerate()
+        .any(|(i, a)| Some(i) != except && (a.name == name || a.email == name));
+    if clash {
+        bail!("an account named '{name}' already exists");
+    }
+    Ok(())
+}
+
 impl Account {
     pub fn from_oauth(name: String, oauth: &Value) -> Result<Self> {
         let email = str_field(oauth, "emailAddress");
@@ -149,13 +174,15 @@ impl Index {
                 .unwrap_or("account")
                 .to_string(),
         };
-        if self
-            .accounts
-            .iter()
-            .enumerate()
-            .any(|(i, a)| a.name == new_name && Some(i) != existing)
-        {
-            bail!("an account named '{new_name}' already exists");
+        // An existing account keeps its (already accepted) name unless one is given.
+        if name.is_some() || existing.is_none() {
+            validate_name(&new_name, &self.accounts, existing).map_err(|e| {
+                if name.is_none() {
+                    e.context("pass an explicit name")
+                } else {
+                    e
+                }
+            })?;
         }
         acct.name = new_name;
 
@@ -175,6 +202,33 @@ impl Index {
         put_cred(&self.accounts[idx].name, &cred)?;
         self.save()?;
         Ok(idx)
+    }
+
+    /// Delete a saved account and its stored credential. Never touches the live login.
+    pub fn remove(&mut self, i: usize) -> Result<Account> {
+        drop_cred(&self.accounts[i].name)?;
+        let a = self.accounts.remove(i);
+        self.save()?;
+        Ok(a)
+    }
+
+    /// Rename account `i`, moving its stored credential. The old copy is only
+    /// dropped once the new one is verified, so a failure never loses the login.
+    pub fn rename(&mut self, i: usize, new: &str) -> Result<()> {
+        validate_name(new, &self.accounts, Some(i))?;
+        let old = self.accounts[i].name.clone();
+        if old == new {
+            return Ok(());
+        }
+        let cred = get_cred(&old)?
+            .with_context(|| format!("no stored credential for '{old}'; run `cacc login {old}`"))?;
+        put_cred(new, &cred)?;
+        if get_cred(new)?.as_ref() != Some(&cred) {
+            bail!("could not verify the copied credential; '{old}' left unchanged");
+        }
+        self.accounts[i].name = new.to_string();
+        self.save()?;
+        drop_cred(&old)
     }
 
     /// Make account `i` the live login.
@@ -227,7 +281,7 @@ pub fn put_cred(name: &str, cred: &Value) -> Result<()> {
     }
 }
 
-fn drop_cred(name: &str) -> Result<()> {
+pub(crate) fn drop_cred(name: &str) -> Result<()> {
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("/usr/bin/security")
             .args([
@@ -242,4 +296,51 @@ fn drop_cred(name: &str) -> Result<()> {
         let _ = fs::remove_file(cred_file(name)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn acct(name: &str, email: &str) -> Account {
+        Account {
+            name: name.into(),
+            email: email.into(),
+            account_uuid: format!("uuid-{name}"),
+            org_uuid: String::new(),
+            org_name: String::new(),
+            oauth_account: json!({}),
+        }
+    }
+
+    fn two() -> Vec<Account> {
+        vec![acct("main", "a@x.com"), acct("work", "b@x.com")]
+    }
+
+    #[test]
+    fn name_rules() {
+        let a = two();
+        assert!(validate_name("side", &a, None).is_ok());
+        for bad in ["", "has space", "a/b", "a\\b", "3", "main", "b@x.com"] {
+            assert!(validate_name(bad, &a, None).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn renaming_to_own_name_is_allowed() {
+        let a = two();
+        assert!(validate_name("main", &a, Some(0)).is_ok());
+        assert!(validate_name("work", &a, Some(0)).is_err());
+    }
+
+    #[test]
+    fn resolve_by_name_email_number_prefix() {
+        let idx = Index { accounts: two() };
+        assert_eq!(idx.resolve("work").unwrap(), 1);
+        assert_eq!(idx.resolve("a@x.com").unwrap(), 0);
+        assert_eq!(idx.resolve("2").unwrap(), 1);
+        assert_eq!(idx.resolve("ma").unwrap(), 0);
+        assert!(idx.resolve("nope").is_err());
+    }
 }
