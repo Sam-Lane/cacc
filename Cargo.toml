@@ -1,0 +1,22 @@
+[package]
+name = "cacc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Switch between multiple Claude Code accounts"
+license = "MIT"
+repository = "https://github.com/Sam-Lane/cacc"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = { version = "3.4.2", features = ["json"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

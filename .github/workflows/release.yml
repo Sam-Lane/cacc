@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: macos-latest, target: x86_64-apple-darwin, name: darwin_amd64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: darwin_arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: linux_amd64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux_arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          [ "$TAG" = "$CRATE" ] || { echo "tag $TAG != Cargo.toml $CRATE"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Archive
+        run: |
+          DIR="cacc_${GITHUB_REF_NAME#v}_${{ matrix.name }}"
+          mkdir -p "dist/$DIR"
+          cp target/${{ matrix.target }}/release/cacc README.md LICENSE "dist/$DIR/"
+          tar -czf "dist/$DIR.tar.gz" -C dist "$DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release & update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz | tee checksums.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --title "Release $GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)"
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sum() { awk -v f="cacc_${VERSION}_$1.tar.gz" '$2 == f {print $1}' artifacts/checksums.txt; }
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Sam-Lane/homebrew-tap" tap
+          mkdir -p tap/Formula
+
+          # Quoted heredoc: nothing is expanded by the shell, placeholders are filled by sed.
+          cat > tap/Formula/cacc.rb <<'EOF'
+          class Cacc < Formula
+            desc "Switch between multiple Claude Code accounts"
+            homepage "https://github.com/Sam-Lane/cacc"
+            version "@VERSION@"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "@BASE@/cacc_@VERSION@_darwin_arm64.tar.gz"
+                sha256 "@DARWIN_ARM64@"
+              else
+                url "@BASE@/cacc_@VERSION@_darwin_amd64.tar.gz"
+                sha256 "@DARWIN_AMD64@"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "@BASE@/cacc_@VERSION@_linux_arm64.tar.gz"
+                sha256 "@LINUX_ARM64@"
+              else
+                url "@BASE@/cacc_@VERSION@_linux_amd64.tar.gz"
+                sha256 "@LINUX_AMD64@"
+              end
+            end
+
+            def install
+              bin.install "cacc"
+            end
+
+            test do
+              assert_match "Claude accounts", shell_output("#{bin}/cacc --help")
+            end
+          end
+          EOF
+          sed -i.bak \
+            -e "s|@VERSION@|${VERSION}|g" \
+            -e "s|@BASE@|${BASE}|g" \
+            -e "s|@DARWIN_ARM64@|$(sum darwin_arm64)|" \
+            -e "s|@DARWIN_AMD64@|$(sum darwin_amd64)|" \
+            -e "s|@LINUX_ARM64@|$(sum linux_arm64)|" \
+            -e "s|@LINUX_AMD64@|$(sum linux_amd64)|" \
+            tap/Formula/cacc.rb
+          rm tap/Formula/cacc.rb.bak
+          if grep -q '@' tap/Formula/cacc.rb; then echo "unfilled placeholder"; cat tap/Formula/cacc.rb; exit 1; fi
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cacc.rb
+          git commit -m "chore: update cacc formula to v${VERSION}"
+          git push
