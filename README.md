@@ -18,6 +18,9 @@ cacc list            # saved accounts, * marks the active one
 cacc switch          # pick an account with fzf (numbered prompt without fzf)
 cacc set work        # switch by name, email or number
 cacc usage           # 5-hour / 7-day usage for every account
+cacc rename work job # rename an account
+cacc remove job      # delete a saved account (asks first, -y to skip)
+cacc doctor          # check tools, live login and saved credentials
 ```
 
 Restart running Claude Code sessions after switching.
